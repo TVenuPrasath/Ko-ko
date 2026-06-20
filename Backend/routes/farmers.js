@@ -1,15 +1,29 @@
 import express from "express";
 import User from "../models/User.js";
-import { verifyToken } from "../middleware/auth.js";
+import { verifyToken, requireCrpOrAdmin } from "../middleware/auth.js";
 import { notifyUsers } from "../utils/notificationService.js";
 
 const router = express.Router();
 
-// GET /api/farmers — CRP gets all SHG Member users
-router.get("/", verifyToken, async (req, res) => {
+const POPULATE = [
+  { path: "hamletId", select: "name" },
+  { path: "streetId", select: "name" },
+  { path: "crpId",    select: "name phone designation assignedLocation" },
+];
+
+// GET /api/farmers
+router.get("/", verifyToken, requireCrpOrAdmin, async (req, res) => {
   try {
-    if (req.user.role !== "CRP") return res.status(403).json({ message: "Forbidden" });
-    const farmers = await User.find({ role: "SHG Member" }).sort({ created_at: -1 });
+    const filter = { role: "SHG Member" };
+    if (req.query.approved === "false") filter.approved = false;
+
+    // CRP only sees their own farmers
+    if (req.user.role === "CRP") {
+      const crpUser = await User.findById(req.user.userId);
+      if (crpUser?.crpProfileId) filter.crpId = crpUser.crpProfileId;
+    }
+
+    const farmers = await User.find(filter).populate(POPULATE).sort({ created_at: -1 });
     res.json(farmers);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -17,10 +31,9 @@ router.get("/", verifyToken, async (req, res) => {
 });
 
 // PATCH /api/farmers/:id/approve
-router.patch("/:id/approve", verifyToken, async (req, res) => {
+router.patch("/:id/approve", verifyToken, requireCrpOrAdmin, async (req, res) => {
   try {
-    if (req.user.role !== "CRP") return res.status(403).json({ message: "Forbidden" });
-    const farmer = await User.findByIdAndUpdate(req.params.id, { approved: true }, { new: true });
+    const farmer = await User.findByIdAndUpdate(req.params.id, { approved: true }, { new: true }).populate(POPULATE);
     if (!farmer) return res.status(404).json({ message: "Farmer not found" });
 
     await notifyUsers([farmer._id.toString()], {
@@ -28,8 +41,6 @@ router.patch("/:id/approve", verifyToken, async (req, res) => {
       title: "Account Approved",
       message: "Your account has been approved. You can now log in.",
       payload: { userId: farmer._id.toString() },
-      hamlet: farmer.hamlet,
-      shg_name: farmer.shg_name,
     });
 
     res.json(farmer);
@@ -39,19 +50,16 @@ router.patch("/:id/approve", verifyToken, async (req, res) => {
 });
 
 // DELETE /api/farmers/:id/reject
-router.delete("/:id/reject", verifyToken, async (req, res) => {
+router.delete("/:id/reject", verifyToken, requireCrpOrAdmin, async (req, res) => {
   try {
-    if (req.user.role !== "CRP") return res.status(403).json({ message: "Forbidden" });
     const farmer = await User.findById(req.params.id);
     if (!farmer) return res.status(404).json({ message: "Farmer not found" });
 
     await notifyUsers([farmer._id.toString()], {
       type: "user_rejected",
       title: "Registration Rejected",
-      message: "Your registration has been rejected. Please contact your CRP for more details.",
+      message: "Your registration has been rejected. Please contact your CRP.",
       payload: { userId: farmer._id.toString() },
-      hamlet: farmer.hamlet,
-      shg_name: farmer.shg_name,
     });
 
     await farmer.deleteOne();
@@ -61,10 +69,9 @@ router.delete("/:id/reject", verifyToken, async (req, res) => {
   }
 });
 
-// DELETE /api/farmers/:id — CRP deletes an existing farmer
-router.delete("/:id", verifyToken, async (req, res) => {
+// DELETE /api/farmers/:id
+router.delete("/:id", verifyToken, requireCrpOrAdmin, async (req, res) => {
   try {
-    if (req.user.role !== "CRP") return res.status(403).json({ message: "Forbidden" });
     const farmer = await User.findByIdAndDelete(req.params.id);
     if (!farmer) return res.status(404).json({ message: "Farmer not found" });
     res.json({ success: true });

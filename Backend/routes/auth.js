@@ -1,7 +1,10 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import User from "../models/User.js";
 import Otp from "../models/Otp.js";
+import Hamlet from "../models/Hamlet.js";
+import Street from "../models/Street.js";
 import { notifyUsersByRole } from "../utils/notificationService.js";
 
 const router = express.Router();
@@ -10,7 +13,31 @@ function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-// POST /api/auth/send-otp
+// POST /api/auth/login — Admin and CRP login with phone + password
+router.post("/login", async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+    if (!phone || !password) return res.status(400).json({ message: "phone and password required" });
+
+    const user = await User.findOne({ phone, role: { $in: [/^ADMIN$/i, /^CRP$/i] } })
+      .populate("crpProfileId");
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const valid = await bcrypt.compare(password, user.password || "");
+    if (!valid) return res.status(401).json({ message: "Invalid password" });
+
+    const token = jwt.sign(
+      { userId: user._id, role: String(user.role || "").toUpperCase(), hamlet: user.hamlet },
+      process.env.JWT_SECRET
+    );
+
+    res.json({ token, user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/send-otp — Farmer OTP login
 router.post("/send-otp", async (req, res) => {
   try {
     const { phone } = req.body;
@@ -43,12 +70,12 @@ router.post("/verify-otp", async (req, res) => {
     record.used = true;
     await record.save();
 
-    const user = await User.findOne({ phone });
+    const user = await User.findOne({ phone }).populate("crpId", "name phone designation assignedLocation");
     if (!user) return res.status(404).json({ message: "User not found. Please register first." });
-    if (!user.approved) return res.status(403).json({ message: "pending", approved: false });
+    if (user.role === "SHG Member" && !user.approved) return res.status(403).json({ message: "pending", approved: false });
 
     const token = jwt.sign(
-      { userId: user._id, role: user.role, hamlet: user.hamlet },
+      { userId: user._id, role: String(user.role || "").toUpperCase(), hamlet: user.hamlet },
       process.env.JWT_SECRET
     );
 
@@ -61,22 +88,50 @@ router.post("/verify-otp", async (req, res) => {
 // POST /api/auth/register
 router.post("/register", async (req, res) => {
   try {
-    const { phone, name, hamlet, street, houseNo, shg_name } = req.body;
-    if (!phone || !name || !hamlet || !shg_name) return res.status(400).json({ message: "Required fields missing" });
+    const { phone, name, hamletId, streetId, houseNo, shg_name } = req.body;
+    if (!phone || !name || !shg_name) return res.status(400).json({ message: "Required fields missing" });
 
     const existing = await User.findOne({ phone });
     if (existing) return res.status(400).json({ message: "Phone already registered" });
 
-    const user = await User.create({ phone, name, hamlet, street, houseNo, shg_name, role: "SHG Member", approved: false });
+    // Resolve hamlet/street names and crpId from IDs
+    let hamletName = req.body.hamlet || "";
+    let streetName = req.body.street || "";
+    let crpId = null;
 
-    const crpIds = await notifyUsersByRole(["CRP"], {
+    if (hamletId) {
+      const hamletDoc = await Hamlet.findById(hamletId).populate("crpId");
+      if (hamletDoc) {
+        hamletName = hamletDoc.name;
+        crpId = hamletDoc.crpId?._id || null;
+      }
+    }
+    if (streetId) {
+      const streetDoc = await Street.findById(streetId);
+      if (streetDoc) streetName = streetDoc.name;
+    }
+
+    const user = await User.create({
+      phone, name,
+      hamletId: hamletId || null,
+      streetId: streetId || null,
+      crpId,
+      hamlet: hamletName,
+      street: streetName,
+      houseNo,
+      shg_name,
+      role: "SHG Member",
+      approved: false,
+    });
+
+    await notifyUsersByRole(["CRP"], {
       type: "user_registration_pending",
       title: "New farmer registration pending approval",
       message: `${name} has registered and is awaiting approval.`,
-      payload: { userId: user._id.toString(), hamlet, shg_name },
+      payload: { userId: user._id.toString(), hamlet: hamletName, shg_name },
     });
 
-    res.status(201).json({ success: true, user, notificationsSent: crpIds.length });
+    res.status(201).json({ success: true, user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -14,6 +14,9 @@ import farmerRoutes from "./routes/farmers.js";
 import shgRoutes from "./routes/shg.js";
 import saleStockRoutes from "./routes/saleStocks.js";
 import activityRoutes from "./routes/activity.js";
+import crpRoutes from "./routes/crps.js";
+import hamletRoutes from "./routes/hamlets.js";
+import streetRoutes from "./routes/streets.js";
 import vaccinationStockRoutes from "./routes/vaccinationStock.js";
 import { startNotificationScheduler } from "./utils/notificationScheduler.js";
 
@@ -36,6 +39,9 @@ app.use("/api/farmers", farmerRoutes);
 app.use("/api/shg", shgRoutes);
 app.use("/api/sale-stocks", saleStockRoutes);
 app.use("/api/activity", activityRoutes);
+app.use("/api/crps", crpRoutes);
+app.use("/api/hamlets", hamletRoutes);
+app.use("/api/streets", streetRoutes);
 app.use("/api/vaccination-stock", vaccinationStockRoutes);
 
 startNotificationScheduler();
