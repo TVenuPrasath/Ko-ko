@@ -6,11 +6,31 @@ import Otp from "../models/Otp.js";
 import Hamlet from "../models/Hamlet.js";
 import Street from "../models/Street.js";
 import { notifyUsersByRole } from "../utils/notificationService.js";
+import { verifyToken } from "../middleware/auth.js";
 
 const router = express.Router();
 
 function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Case-insensitive exact match against a Hamlet's name/nameTa/nameEn — used
+// only by the legacy string-based fallback path below (profile), which never
+// invents an id or guesses: an ambiguous match (2+ hamlets sharing the
+// supplied value) is treated the same as no match at all. No fuzzy, partial,
+// or transliteration matching — exact string equality after trimming/case-
+// folding only.
+async function findHamletByLegacyName(hamletName) {
+  if (!hamletName) return null;
+  const target = hamletName.trim().toLowerCase();
+  if (!target) return null;
+
+  const hamlets = await Hamlet.find({}, "name nameTa nameEn crpId");
+  const matches = hamlets.filter((h) =>
+    [h.name, h.nameTa, h.nameEn].some((v) => typeof v === "string" && v.trim().toLowerCase() === target)
+  );
+
+  return matches.length === 1 ? matches[0] : null;
 }
 
 // POST /api/auth/login — Admin and CRP login with phone + password
@@ -152,6 +172,78 @@ router.post("/seed-crp", async (req, res) => {
 
     const user = await User.create({ phone, name, role, hamlet, approved: true });
     res.status(201).json(user);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/auth/profile — farmer updates own profile
+router.patch("/profile", verifyToken, async (req, res) => {
+  try {
+    const { name, houseNo, hamlet, street, hamletId, streetId } = req.body;
+    const allowed = {};
+    if (name  !== undefined) allowed.name    = String(name).trim();
+    if (houseNo !== undefined) allowed.houseNo = String(houseNo).trim();
+
+    if (hamletId) {
+      // Preferred ID-based path. Free-text hamlet/street on the same request are
+      // ignored — the denormalized display strings only ever come from the
+      // resolved canonical documents, never from client-supplied text.
+      const hamletDoc = await Hamlet.findById(hamletId);
+      if (!hamletDoc) return res.status(400).json({ message: "Invalid hamletId" });
+
+      allowed.hamletId = hamletDoc._id;
+      allowed.crpId = hamletDoc.crpId || null;
+      allowed.hamlet = hamletDoc.nameTa || hamletDoc.name || "";
+
+      if (streetId) {
+        const streetDoc = await Street.findById(streetId);
+        if (!streetDoc || streetDoc.hamletId.toString() !== hamletDoc._id.toString()) {
+          return res.status(400).json({ message: "streetId does not belong to the selected hamlet" });
+        }
+        allowed.streetId = streetDoc._id;
+        allowed.street = streetDoc.nameTa || streetDoc.name || "";
+      }
+    } else if (hamlet !== undefined) {
+      // Legacy free-text fallback for older app versions — matches case-
+      // insensitively against name/nameTa/nameEn; otherwise unchanged behavior.
+      const hamletName = String(hamlet).trim();
+      allowed.hamlet = hamletName;
+      const hamletDoc = await findHamletByLegacyName(hamletName);
+      const resolvedHamletId = hamletDoc ? hamletDoc._id : null;
+      allowed.hamletId = resolvedHamletId;
+      allowed.crpId = hamletDoc ? (hamletDoc.crpId || null) : null;
+
+      if (street !== undefined) {
+        const streetName = String(street).trim();
+        allowed.street = streetName;
+        const streetDoc = (streetName && resolvedHamletId)
+          ? await Street.findOne({ name: streetName, hamletId: resolvedHamletId })
+          : null;
+        allowed.streetId = streetDoc ? streetDoc._id : null;
+      }
+    } else if (street !== undefined) {
+      // Street-only free-text change, hamlet untouched — legacy behavior. Resolves
+      // against the farmer's existing hamletId.
+      const streetName = String(street).trim();
+      allowed.street = streetName;
+      const hamletIdForStreet = (await User.findById(req.user.userId, "hamletId"))?.hamletId || null;
+      const streetDoc = (streetName && hamletIdForStreet)
+        ? await Street.findOne({ name: streetName, hamletId: hamletIdForStreet })
+        : null;
+      allowed.streetId = streetDoc ? streetDoc._id : null;
+    }
+
+    if (!allowed.name) return res.status(400).json({ message: "Name is required" });
+
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $set: allowed },
+      { new: true, runValidators: true }
+    ).select("-password");
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

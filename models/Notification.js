@@ -31,6 +31,8 @@ const notificationSchema = new mongoose.Schema({
       "loan_due_reminder",
       "loan_disbursed",
       "vaccination_stock_reminder",
+      "vaccination_stock_monthly_reminder",
+      "weekly_stock_reminder",
     ],
     required: true,
   },

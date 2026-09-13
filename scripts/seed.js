@@ -15,6 +15,18 @@ const CRP_HAMLET_MAP = [
   { name: "Kalaiselvi",     phone: "9500365785", designation: "CRP", assignedLocation: "Konangipatti",   hamlets: ["Konangipatti"] },
 ];
 
+// Tamil renderings of the English hamlet names above, needed because Hamlet.nameTa
+// is now required. Best-effort transliteration for seed purposes only — exact
+// alignment with any legacy farmer-facing hamlet names is a later reconciliation
+// concern, not this seed script's job.
+const HAMLET_NAME_TA = {
+  "Namakkal":      "நாமக்கல்",
+  "Mohanur":       "மோகனூர்",
+  "Mallasamudram": "மல்லசமுத்திரம்",
+  "Pallipalayam":  "பள்ளிபாளையம்",
+  "Konangipatti":  "கோணாங்கிப்பட்டி",
+};
+
 async function seed() {
   await mongoose.connect(process.env.MONGO_URI);
   console.log("Connected to MongoDB");
@@ -50,11 +62,21 @@ async function seed() {
     for (const hamletName of entry.hamlets) {
       let hamlet = await Hamlet.findOne({ name: hamletName });
       if (!hamlet) {
-        hamlet = await Hamlet.create({ name: hamletName, crpId: crp._id });
+        hamlet = await Hamlet.create({
+          name: hamletName,
+          nameEn: hamletName,
+          nameTa: HAMLET_NAME_TA[hamletName] || hamletName,
+          crpId: crp._id,
+        });
         console.log(`   Hamlet created: ${hamletName} → ${entry.name}`);
-      } else if (!hamlet.crpId) {
-        hamlet.crpId = crp._id;
-        await hamlet.save();
+      } else if (!hamlet.crpId || !hamlet.nameTa || !hamlet.nameEn) {
+        // findByIdAndUpdate (not .save()) so this never triggers full-document
+        // validation against fields untouched by this update.
+        await Hamlet.findByIdAndUpdate(hamlet._id, {
+          crpId: hamlet.crpId || crp._id,
+          nameTa: hamlet.nameTa || HAMLET_NAME_TA[hamletName] || hamletName,
+          nameEn: hamlet.nameEn || hamletName,
+        });
         console.log(`   Hamlet updated: ${hamletName} → ${entry.name}`);
       }
     }

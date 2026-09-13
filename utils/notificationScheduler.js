@@ -17,6 +17,27 @@ function formatDate(d) {
   return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
 }
 
+function addMonths(date, months) {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
+// Client is in Tamil Nadu — "Day 1 of the month" / "Friday" must follow the India
+// calendar regardless of the server host's own timezone (e.g. Render runs UTC).
+function getIstDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+  }).formatToParts(date);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return { year: Number(map.year), month: Number(map.month), day: Number(map.day), weekday: map.weekday };
+}
+
 async function runDailyCheck() {
   try {
     const today = normalizeDate(new Date());
@@ -149,8 +170,36 @@ async function runDailyCheck() {
       );
     }
 
-    // Remind farmers to enter vaccination stock once in 2 weeks
     const activeFarmers = await User.find({ role: "SHG Member", approved: true });
+
+    // Monthly vaccination-stock entry reminder — Day 1 of the month, India calendar (Asia/Kolkata).
+    // Separate from the 30-day age-progression logic and the 14-day resubmission nudge below.
+    if (getIstDateParts(new Date()).day === 1 && activeFarmers.length) {
+      await notifyUsers(
+        activeFarmers.map((farmer) => farmer._id.toString()),
+        {
+          type: "vaccination_stock_monthly_reminder",
+          title: "Vaccination Stock Update",
+          message: "இன்று மாதத்தின் முதல் நாள் — உங்கள் தடுப்பூசி இருப்பு விவரங்களை பதிவு செய்யவும் / Today is the 1st of the month — please enter/update your vaccination stock.",
+        }
+      );
+    }
+
+    // Weekly stock entry reminder — every Friday, India calendar (Asia/Kolkata).
+    // Client requirement #4. Separate feature from vaccination-stock reminders above
+    // and from BirdUpdate/SaleStock submission logic (neither is modified by this).
+    if (getIstDateParts(new Date()).weekday === "Fri" && activeFarmers.length) {
+      await notifyUsers(
+        activeFarmers.map((farmer) => farmer._id.toString()),
+        {
+          type: "weekly_stock_reminder",
+          title: "Weekly Stock Update",
+          message: "இன்று வெள்ளிக்கிழமை — உங்கள் தற்போதைய வாராந்திர இருப்பு எண்ணிக்கையை பதிவு செய்யவும். இது ஞாயிற்றுக்கிழமை விற்பனையை திட்டமிட உதவும் / Today is Friday — please enter/update your current weekly stock numbers. This helps plan sales for Sunday.",
+        }
+      );
+    }
+
+    // Remind farmers to enter vaccination stock once in 2 weeks
     for (const farmer of activeFarmers) {
       const latestStock = await VaccinationStock.findOne({ userId: farmer._id }).sort({ createdAt: -1 });
       const fourteenDaysAgo = new Date();
@@ -173,46 +222,51 @@ async function runDailyCheck() {
       }
     }
 
-    // Auto-progress vaccination stock categories every 14 days
-    const CATEGORY_ORDER = ["week0", "week2", "week4", "week6", "week8", "week10", "week12", "month4", "month5"];
+    // Auto-progress monthly vaccination stock categories every 30 days
+    const CATEGORY_ORDER = ["withinMonth", "month2", "month3", "month4Plus"];
     const CATEGORY_LABELS = {
-      week0: "F Strain Vaccine", week2: "IBD Vaccine", week4: "LaSota Vaccine",
-      week6: "Fowl Pox Vaccine", week8: "Dewormer", week10: "R2B + Dewormer",
-      week12: "Multivitamins", month4: "Monitor (Booster Soon)", month5: "R2B Booster + Dewormer",
+      withinMonth: "Within 1 month -- Lasota",
+      month2: "2 months old -- Fowl Pox",
+      month3: "3 months old -- Infectious Coryza",
+      month4Plus: "4 to 7 months & above -- RDVK + Deworming",
     };
     const CATEGORY_TAMIL = {
-      week0: "1 வார வயதுக்குள்", week2: "2-3 வார வயது", week4: "4-5 வார வயது",
-      week6: "6-7 வார வயது", week8: "8-9 வார வயது", week10: "10-11 வார வயது",
-      week12: "12-13 வார வயது", month4: "4 மாதங்கள் ஆனவை", month5: "5 மாதங்கள் ஆனவை",
+      withinMonth: "1 மாதத்திற்குள் -- Lasota",
+      month2: "2 மாத வயது -- Fowl Pox",
+      month3: "3 மாத வயது -- Infectious Coryza",
+      month4Plus: "4 முதல் 7 மாதங்கள் மேல் -- RDVK + Deworming",
     };
 
     const allStocks = await VaccinationStock.find().populate("userId");
     for (const stock of allStocks) {
       const lastProgressed = new Date(stock.lastProgressedAt || stock.entryDate);
       const daysSince = Math.floor((today - lastProgressed) / 86400000);
-      if (daysSince < 14) continue;
+      if (daysSince < 30) continue;
 
-      // Shift each category to the next one
-      const updated = {};
-      for (let i = 0; i < CATEGORY_ORDER.length; i++) {
-        const current = CATEGORY_ORDER[i];
-        const next = CATEGORY_ORDER[i + 1];
-        updated[current] = next ? (stock[next] || 0) : 0;
-      }
-      // Last category (month5) birds have completed the cycle — set to 0
-      updated["month5"] = 0;
+      const updated = {
+        withinMonth: 0,
+        month2: stock.withinMonth || 0,
+        month3: stock.month2 || 0,
+        month4Plus: (stock.month3 || 0) + (stock.month4Plus || 0),
+      };
       updated.lastProgressedAt = new Date();
       updated.updatedAt = new Date();
+
+      // Birds actually moved into a new category — that category now needs its own
+      // vaccination action, so a stale "completed" status from the previous category
+      // must not hide it from the CRP.
+      const hadMovement = (stock.withinMonth || 0) + (stock.month2 || 0) + (stock.month3 || 0) > 0;
+      if (hadMovement) updated.status = "pending";
 
       await VaccinationStock.findByIdAndUpdate(stock._id, updated);
 
       // Send notifications for each newly progressed category
       const farmer = stock.userId;
       if (!farmer) continue;
-      for (let i = 0; i < CATEGORY_ORDER.length - 1; i++) {
+      for (let i = 1; i < CATEGORY_ORDER.length; i++) {
         const nextCat = CATEGORY_ORDER[i];
-        const count = stock[CATEGORY_ORDER[i + 1]] || 0; // birds moving into nextCat
-        if (!count || nextCat === "month4") continue;
+        const count = stock[CATEGORY_ORDER[i - 1]] || 0; // birds moving into nextCat
+        if (!count) continue;
         const label = CATEGORY_LABELS[nextCat];
         const tamil = CATEGORY_TAMIL[nextCat];
         await notifyUsers([farmer._id.toString()], {
@@ -229,6 +283,52 @@ async function runDailyCheck() {
             payload: { category: nextCat, count, vaccine: label, farmerId: farmer._id.toString() },
           });
         }
+      }
+    }
+
+    // RDVK (month4Plus) 3-month recurrence — client requirement #3.
+    // Independent of the age-progression above and completely separate from
+    // scheduleEngine.js / System B (BirdBatch, R2B, 120-day booster schedule).
+    const rdvkStocks = await VaccinationStock.find({ month4Plus: { $gt: 0 } }).populate("userId");
+    for (const stock of rdvkStocks) {
+      if (!stock.rdvkNextDueAt) {
+        // First time this farmer has RDVK-eligible (month4Plus) birds. Anchor the
+        // recurrence to the same "vaccination date" already used elsewhere in this
+        // workflow (entryDate + 3 days), then RDVK repeats every 3 months from there.
+        const firstRdvkDate = new Date(stock.entryDate);
+        firstRdvkDate.setDate(firstRdvkDate.getDate() + 3);
+        await VaccinationStock.findByIdAndUpdate(stock._id, {
+          rdvkNextDueAt: addMonths(firstRdvkDate, 3),
+        });
+        continue;
+      }
+
+      if (today < normalizeDate(stock.rdvkNextDueAt)) continue;
+
+      // Advance the stored due date before/with the notification so a re-run of this
+      // check (same day or later) can never fire the same RDVK cycle twice.
+      const nextDueAt = addMonths(stock.rdvkNextDueAt, 3);
+      await VaccinationStock.findByIdAndUpdate(stock._id, {
+        status: "pending",
+        rdvkNextDueAt: nextDueAt,
+      });
+
+      const farmer = stock.userId;
+      if (!farmer) continue;
+
+      await notifyUsers([farmer._id.toString()], {
+        type: "vaccination_reminder",
+        title: "RDVK + Deworming Due",
+        message: `${stock.month4Plus} birds are now due for RDVK + Deworming (4 to 7 months & above -- repeats every 3 months)`,
+        payload: { category: "month4Plus", count: stock.month4Plus, vaccine: "RDVK + Deworming" },
+      });
+      if (crpIds.length) {
+        await notifyUsers(crpIds, {
+          type: "vaccination_reminder",
+          title: "RDVK + Deworming Due",
+          message: `${farmer.name || "Farmer"}'s ${stock.month4Plus} birds are now due for RDVK + Deworming (repeat)`,
+          payload: { category: "month4Plus", count: stock.month4Plus, vaccine: "RDVK + Deworming", farmerId: farmer._id.toString() },
+        });
       }
     }
 

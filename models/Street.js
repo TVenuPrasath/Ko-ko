@@ -1,7 +1,10 @@
 import mongoose from "mongoose";
 
 const streetSchema = new mongoose.Schema({
+  // Deprecated — kept for backward compatibility until callers migrate to nameTa/nameEn.
   name:     { type: String, required: true },
+  nameTa:   { type: String, required: true },
+  nameEn:   { type: String, required: true },
   hamletId: { type: mongoose.Schema.Types.ObjectId, ref: "Hamlet", required: true },
   createdAt: { type: Date, default: Date.now },
 });

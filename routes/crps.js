@@ -4,6 +4,7 @@ import Crp from "../models/Crp.js";
 import User from "../models/User.js";
 import Hamlet from "../models/Hamlet.js";
 import { verifyToken, requireAdmin } from "../middleware/auth.js";
+import { reassignHamletCrp } from "../utils/hamletCrp.js";
 
 const router = express.Router();
 
@@ -35,9 +36,9 @@ router.post("/", verifyToken, requireAdmin, async (req, res) => {
     });
 
     if (Array.isArray(assignedHamlets) && assignedHamlets.length) {
-      await Hamlet.updateMany({ _id: { $in: assignedHamlets } }, { crpId: crp._id });
-      await User.updateMany({ hamletId: { $in: assignedHamlets } }, { crpId: crp._id });
-      await Crp.updateMany({ _id: { $ne: crp._id }, assignedHamlets: { $in: assignedHamlets } }, { $pull: { assignedHamlets: { $in: assignedHamlets } } });
+      for (const hamletId of assignedHamlets) {
+        await reassignHamletCrp(hamletId, crp._id);
+      }
     }
 
     if (!(await User.findOne({ phone }))) {
@@ -58,12 +59,18 @@ router.patch("/:id", verifyToken, requireAdmin, async (req, res) => {
     const crp = await Crp.findById(req.params.id);
     if (!crp) return res.status(404).json({ message: "CRP not found" });
 
-    const previousHamlets = Array.isArray(crp.assignedHamlets) ? crp.assignedHamlets : [];
     if (Array.isArray(assignedHamlets)) {
-      await Hamlet.updateMany({ _id: { $in: previousHamlets }, crpId: crp._id }, { $unset: { crpId: "" } });
-      await User.updateMany({ hamletId: { $in: previousHamlets }, crpId: crp._id }, { $unset: { crpId: "" } });
-      await Hamlet.updateMany({ _id: { $in: assignedHamlets } }, { crpId: crp._id });
-      await User.updateMany({ hamletId: { $in: assignedHamlets } }, { crpId: crp._id });
+      const previousHamlets = Array.isArray(crp.assignedHamlets) ? crp.assignedHamlets : [];
+      const previousSet = new Set(previousHamlets.map(String));
+      const nextSet = new Set(assignedHamlets.map(String));
+      const removed = [...previousSet].filter((id) => !nextSet.has(id));
+
+      for (const hamletId of removed) {
+        await reassignHamletCrp(hamletId, null);
+      }
+      for (const hamletId of assignedHamlets) {
+        await reassignHamletCrp(hamletId, crp._id);
+      }
       crp.assignedHamlets = assignedHamlets;
     }
 
@@ -105,13 +112,16 @@ router.patch("/:id/hamlets", verifyToken, requireAdmin, async (req, res) => {
     if (!crp) return res.status(404).json({ message: "CRP not found" });
 
     const previousHamlets = Array.isArray(crp.assignedHamlets) ? crp.assignedHamlets : [];
-    if (previousHamlets.length) {
-      await Hamlet.updateMany({ _id: { $in: previousHamlets }, crpId: crp._id }, { $unset: { crpId: "" } });
-      await User.updateMany({ hamletId: { $in: previousHamlets }, crpId: crp._id }, { $unset: { crpId: "" } });
-    }
+    const previousSet = new Set(previousHamlets.map(String));
+    const nextSet = new Set(hamletIds.map(String));
+    const removed = [...previousSet].filter((id) => !nextSet.has(id));
 
-    await Hamlet.updateMany({ _id: { $in: hamletIds } }, { crpId: crp._id });
-    await User.updateMany({ hamletId: { $in: hamletIds } }, { crpId: crp._id });
+    for (const hamletId of removed) {
+      await reassignHamletCrp(hamletId, null);
+    }
+    for (const hamletId of hamletIds) {
+      await reassignHamletCrp(hamletId, crp._id);
+    }
 
     crp.assignedHamlets = hamletIds;
     await crp.save();
@@ -122,12 +132,39 @@ router.patch("/:id/hamlets", verifyToken, requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/crps/:id — Admin deletes CRP
+// DELETE /api/crps/:id — Admin deletes CRP. Clears the CRP relationship from
+// every Hamlet/farmer that referenced it before removing anything, so no
+// dangling crpId is left behind. Hamlets, Streets, and farmer records are
+// never deleted — only the CRP link on them is cleared. The CRP document
+// itself is deleted last, so if an earlier step fails, retrying this request
+// is safe (the clearing steps are idempotent) rather than leaving the CRP
+// gone with stale references still pointing at it.
 router.delete("/:id", verifyToken, requireAdmin, async (req, res) => {
   try {
-    const crp = await Crp.findByIdAndDelete(req.params.id);
+    const crp = await Crp.findById(req.params.id);
     if (!crp) return res.status(404).json({ message: "CRP not found" });
+
+    // Identify every Hamlet actually pointing at this CRP (the authoritative
+    // Hamlet.crpId field, not the CRP's own possibly-stale assignedHamlets
+    // array) and unassign each through the shared helper — the same sync path
+    // every other CRP/hamlet mutation uses, so this preserves the same
+    // Hamlet.crpId <-> Crp.assignedHamlets <-> User.crpId invariant rather than
+    // duplicating that logic here.
+    const hamletsToUnassign = await Hamlet.find({ crpId: crp._id }, "_id");
+    for (const hamlet of hamletsToUnassign) {
+      await reassignHamletCrp(hamlet._id, null);
+    }
+
+    // Safety net: clear crpId on any farmer still referencing this CRP
+    // directly, even one whose hamlet assignment was already inconsistent
+    // (e.g. a stale crpId that didn't match their hamlet's own crpId).
+    await User.updateMany({ crpId: crp._id, role: "SHG Member" }, { crpId: null });
+
+    // Only now remove the CRP's login account and the CRP document itself —
+    // nothing still references crp._id at this point.
     await User.findOneAndDelete({ crpProfileId: crp._id });
+    await Crp.findByIdAndDelete(crp._id);
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -22,7 +22,7 @@ router.get("/", verifyToken, async (req, res) => {
         _id: b._id,
         farmerName: b.userId?.name || "—",
         hamlet: b.userId?.hamlet || "—",
-        action: `கோழி எண்ணிக்கை புதுப்பித்தார் (குஞ்சு: ${b.chicks}, வளர்ச்சி: ${b.growers}, முட்டை: ${b.layers}, கறி: ${b.broilers})`,
+        action: `கோழி எண்ணிக்கை புதுப்பித்தார் (3 மாதத்திற்குள்: ${b.chicks}, 3 மாதத்திற்கு மேல்: ${b.layers})`,
         type: "bird",
         createdAt: b.createdAt,
       })),
